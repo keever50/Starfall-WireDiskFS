@@ -1,0 +1,375 @@
+--@name DiskFS FAT12 DiskImage
+--@author
+--@shared
+--@include netvar.txt
+--@include async.txt
+async = require("async.txt")
+require("netvar.txt")
+
+if SERVER then
+    wire.adjustInputs({"DiskLink"}, {"Wirelink"})    
+    disk = wire.ports.DiskLink
+    
+    DFS = {}
+    DFS.printLog = true
+    DFS.loghistory = {}
+    DFS.FAT = {}
+    
+    DFS.log = function( msg )
+        if DFS.printLog == true then print(msg) end
+        table.insert(DFS.loghistory, 0, msg )    
+    end
+    
+    DFS.DiskImage = {}
+    DFS.DiskImageReceived = false
+    DFS.ReceiveDiskImage = function( data )
+        print("received")
+        DFS.DiskImageReceived = true
+        DFS.DiskImage = data
+    end
+    
+    DFS.WriteSector = function( disk, sector, data )
+        while disk[3] == 1 do async.yield() end --wait while busy
+        
+        for i=0, 511 do
+            --print( data[i])
+            local d = data[i]
+            if d == nil then d = 0 end
+            disk[512+i]=d
+            
+        end
+        
+        disk[0]=sector
+        while disk[3] == 1 do async.yield() end --wait while busy
+        
+    end
+    
+    DFS.ReadSector = function( disk, sector )
+        while disk[3] == 1 do async.yield() end --wait while busy
+        disk[1]=sector
+        async.yield() --skip tick
+        while disk[3] == 1 do async.yield() end --wait while busy
+        local buffer = {}
+        for i=0, 511 do
+            buffer[i]=disk[512+i]
+        end
+        return buffer
+    end
+    
+    DFS.Format = function( disk, quick )
+        while disk[3] == 1 do async.yield() end --wait while busy
+        
+        if quick == false then
+            DFS.log("[FORMAT] Erasing disk...")
+            for sector=0, disk[5]-1 do --
+                for i=512, 1024 do disk[i]=0 end
+                disk[0]=sector
+                while disk[3] == 1 do async.yield() end --wait while busy
+            end
+            DFS.log("[FORMAT] Disk erased.")
+        end
+        --DFS.log("[FORMAT] 
+        --NNNNNNNN 
+        
+    end
+    
+    --DFS.GetBootSector()
+    
+    DFS.InstallDiskImage = function( disk, image )
+    
+        DFS.log("[DISK IMAGE] Loading...")
+        image = string.toTable(image)
+        sectorbuffer = {}
+        t = {}
+        
+        --generate sectors
+        char = 0
+        for sector=0, math.round(#image/512) do 
+            local buffer = {}
+            for a=0, 511 do
+                local c = image[char+1]
+                if c == nil then c = "" end
+                local b = string.byte(c, 0, 1)
+                buffer[a] = b
+                char=char+1
+            end    
+            sectorbuffer[sector]=buffer
+        end
+        
+        DFS.log("[DISK IMAGE] Installing...")
+        for sector=0, math.round(#image/512) do
+           -- print(sector)
+            local data = sectorbuffer[sector]
+            if data == nil then print("nodata") break end
+            DFS.WriteSector( disk, sector, data)    
+        end
+        
+        DFS.log("[DISK IMAGE] Installed and ready")
+    end
+    
+    DFS.Word16ToInt = function( data, address )
+        local A = data[address]
+        local B = data[address+1]
+        if A == nil then A = 0 end if B == nil then B = 0 end
+        
+        local word = 0
+        word = B
+        word = bit.lshift(word, 8)  
+        word = bit.bor(word, A ) 
+        return word
+
+        
+    end
+    
+    DFS.Word32ToInt = function( data, address )
+        local A = data[address]
+        local B = data[address+1]  
+        local C = data[address+2]
+        local D = data[address+3]  
+        if A == nil then A = 0 end
+        if B == nil then B = 0 end
+        if C == nil then C = 0 end
+        if D == nil then D = 0 end
+        
+        local word = 0
+        
+        word = D
+        word = bit.lshift(word, 8)
+        
+        word = bit.bor(word, C)
+        word = bit.lshift(word, 8)
+        
+        word = bit.bor(word, B)
+        word = bit.lshift(word, 8)
+        
+        word = bit.bor(word, A)
+        
+        return word
+                 
+    end
+    
+    DFS.BytesToString = function( data, start, len )
+        local b = 0
+        local chars = {}
+        len = len - 1
+        for i=start, start+len do
+            b=b+1
+            chars[b]=string.utf8char(data[i])
+                            
+        end
+        --printTable(chars)
+        return table.concat(chars)
+        --return table.toString(chars)
+    end
+    
+    DFS.ExtractBytesFrom12BitFAT = function( data, address ) --READS 3 ADRESSES. 24BIT OUTPUTS 2 BYTES
+        local A = data[address]
+        local B = data[address+1]
+        local C = data[address+2]
+        
+        local First = 0
+        local Second = 0
+        
+        if A==nil then A = 0 end
+        if B==nil then B = 0 end
+        if C==nil then C = 0 end  
+        
+        --Extract 3 bytes. [AA][BA][BB] AAAAAAAA BBBBAAAA BBBBBBBB
+          
+        --Extract first byte and last 4 bits of second byte.         BBBBAAAAAAAA <-
+        local Band = bit.band(B, 0x0F) -- 0000BBBB
+        local Band = bit.lshift(Band, 8)--BBBB00000000
+        First = bit.bor(Band, A)---       BBBBAAAAAAAA
+            
+        --Extract first 4 bits of first byte and extract third byte. CCCCCCCCBBBB <-
+        Band = bit.band(B, 0xF0) -- BBBB0000
+        Band = bit.rshift(Band, 4)--0000BBBB
+        local SC = bit.lshift(C,4)--CCCCCCCC0000
+        Second = bit.bor(C, Band)---CCCCCCCCBBBB    
+    
+        
+        return {First, Second}
+        
+    end
+    
+    DFS.GetFAT12 = function( disk, info ) --Only supports one sector sized FAT for now
+        local sector = info.reservedSectors+1
+        local FAT = DFS.ReadSector( disk, sector ) 
+        local Extracted = {}
+        for i=0, math.round( 512/3 ) do  
+            local T = DFS.ExtractBytesFrom12BitFAT( FAT, i*3 )       
+            Extracted[i*2]=T[1]
+            Extracted[(i*2)+1]=T[2]
+        end
+        return Extracted
+    end
+    
+    DFS.ReadClusterChain = function( info, FAT, begin ) --Made for FAT12
+        local clusters = {}
+        --if data == 4095 then
+        local count = 0
+        local pos = begin
+        while true do
+        
+            if count > 1024 then DFS.log("[FAT ERROR] infinited cluster chain or 0" ) return false end
+            
+            local next = FAT[pos]
+            local skip = ( DFS.FindRoot(info)+DFS.RootSize(info)) - (info.numberOfFATs*info.sectorsPerFAT)
+            clusters[count] = skip+pos
+            
+            if next == 4095 then --EOL
+                return clusters
+            end
+            
+            pos = next
+            count = count + 1
+              
+        end
+        
+    end
+    
+    DFS.GetDiskInfo = function( disk ) --Returns disk info table
+        local info = {}
+        bootSector = DFS.ReadSector( disk, 0 )
+        
+        
+        --OEM NAME--
+        info.OEMName = DFS.BytesToString( bootSector, 3, 8 )
+        
+        --Bytes Per Sector
+        info.bytesPerSector = DFS.Word16ToInt(bootSector, 11)
+        
+        --Sectors Per Cluster
+        info.sectorsPerCluster = bootSector[13]
+        
+        --Reserved sectors
+        info.reservedSectors = DFS.Word16ToInt(bootSector, 14)  
+        
+        --Number of file allocation tables
+        info.numberOfFATs = bootSector[16]
+        
+        --Root Entries
+        info.rootEntries = DFS.Word16ToInt(bootSector, 17)
+        
+        --Small Sectors
+        info.smallSectors = DFS.Word16ToInt(bootSector, 19)
+        
+        --Sectors per file allocation table
+        info.sectorsPerFAT = DFS.Word16ToInt(bootSector, 22)
+        
+        --File system
+        info.fileSystem = DFS.BytesToString( bootSector, 54, 8 )
+        
+        return info
+    end
+
+    DFS.FindRoot = function( info ) --returns sector
+        local sector = 0
+        sector = info.reservedSectors 
+        return sector + info.numberOfFATs --Not entirely sure if this is working in all cases.
+    end
+    
+    DFS.RootSize = function( info ) --Sectors
+        return (info.rootEntries*32)/512 
+    end
+    
+    DFS.GetDirectoryEntries = function( data ) --Use this to list directories from a sector stored in a table. 512 bytes.
+        --length is 32. 0-31
+        local entries = {}
+        local entryLocation = 0
+        
+        for i=0, 16 do
+        
+            --copy entry--
+            local rawentry = {} local entry = {} local p = 0
+            for e=entryLocation, entryLocation+31 do
+                rawentry[p] = data[e]   
+                p=p+1              
+            end
+            
+            --read entry
+            --entry.raw = rawentry
+            entry.name = DFS.BytesToString( rawentry, 0, 7 )
+            entry.extension  = DFS.BytesToString( rawentry, 8, 3 )
+            entry.attributes = rawentry[11]
+            entry.creationTime = DFS.Word16ToInt( rawentry, 14 )
+            entry.creationDate = DFS.Word16ToInt( rawentry, 16 )
+            entry.lastAccessDate = DFS.Word16ToInt( rawentry, 18 )
+            entry.unknown = DFS.Word16ToInt( rawentry, 20 )
+            entry.lastWriteTime = DFS.Word16ToInt( rawentry, 22 )
+            entry.lastWriteDate = DFS.Word16ToInt( rawentry, 24 )
+            entry.firstLogicalCluster = DFS.Word16ToInt( rawentry, 26 ) --to be found in FAT table
+            entry.size = DFS.Word32ToInt( rawentry, 28 ) --in bytes
+            
+            entries[i+1]=entry
+            
+            entryLocation=entryLocation+32
+        end
+        return entries
+    end
+    
+    DFS.OpenDir = function( disk, info, FAT, currentDir, dirName )
+        for i, v in ipairs( currentDir ) do
+            print(v.name)
+            if v.name == dirName then
+                
+                return DFS.GetDirectoryEntries( DFS.ReadSector( disk, DFS.ReadClusterChain( info, FAT, v.firstLogicalCluster )[0] ) )
+                   
+            end
+        end    
+        DFS.log("[OpenDir] Coulnt find directory name " .. dirName )  
+        return {}      
+    end
+    
+    hook.add("net", "net", function( n, l, p )
+        if n == "image_file" then
+            print(n, l)
+            net.readStream(DFS.ReceiveDiskImage)
+        end
+    end)        
+    
+    --Testing below
+    
+    async.thread.create(function()
+        async.wait(1)
+        --DFS.Format( disk, false )    
+        --while DFS.DiskImageReceived == false do async.wait(0.1) end --wait till diskimage received
+        --DFS.InstallDiskImage( disk, DFS.DiskImage )
+        
+        --disk[1] = 0
+        --while disk[3] == 1 do async.yield() end --wait while busy
+        --print( string.utf8char( disk[512] ))
+        
+        local info = DFS.GetDiskInfo( disk )
+        local FAT = {}
+        repeat 
+            FAT = DFS.GetFAT12( disk, info )
+            async.wait(0.1)
+        until FAT != nil 
+        
+       
+        local RootSector = DFS.FindRoot( info )
+        
+        local D = DFS.ReadSector( disk, RootSector ) -- + DFS.RootSize( info ) 
+        local RootDir = DFS.GetDirectoryEntries( D )
+        
+        printTable(DFS.OpenDir( disk, info, FAT, RootDir, "DIR    " ))
+        
+        
+    end):run()
+    
+
+    
+    
+end
+
+if CLIENT then
+    if player() == owner() and false then
+        local img = file.read("DFS/DFSB.img")
+        net.start("image_file")
+        net.writeStream(img, true)
+        net.send()
+    end
+end
+
+

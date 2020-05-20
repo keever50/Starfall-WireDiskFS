@@ -1,0 +1,136 @@
+--@name DiskDrive
+--@author
+--@shared
+--@include DiskLib.txt
+--@include netvar.txt
+--@include async.txt
+
+require("DiskLib.txt")
+async = require("async.txt")
+require("netvar.txt")
+
+if SERVER then
+    wire.adjustInputs({"Disk", "Head", "Base", "Lock", "Insert"},{"Entity", "Entity", "Entity","Entity", "Number"})
+    wire.adjustOutputs({"Link"}, {"Normal"})
+    DiskLoaded = false
+    
+    busy = true
+    buffer = {}
+    cell = {}
+    
+    doWrite = false
+    writeSector = 0
+    
+    doRead = false
+    readSector = 0
+    
+    --Driver--
+    async.thread.create(function()
+        
+    
+        --wait for connections--
+        while wire.ports.Head == nil or wire.ports.Base == nil or wire.ports.Lock == nil do
+            async.wait(0.1)
+        end
+        
+        --Init--
+        head = DD.InitHead( wire.ports.Head, wire.ports.Base )
+        spinner = DD.InitSpinner( wire.ports.Lock )
+        
+        while true do
+            async.yield()
+            if wire.ports.Insert == 1 then
+                spinner["Disable"] = 0
+                if spinner["Locked"] == 1 then
+                
+                    --Run once--
+                    if DiskLoaded == false then
+                        disk = DD.CalcDisk( wire.ports.Disk, 6, head[25])
+                        DiskLoaded = true
+                        async.wait(1)
+                        busy = false
+                        DD.spinspeed = 100
+                    end
+                    
+                    --Keep running--
+                    if doWrite == true then
+                        DD.WriteSector( head, disk, writeSector, buffer )
+                        doWrite = false
+                        busy = false
+                    end
+                    
+                    if doRead == true then
+                        buffer = {}
+                        buffer = DD.ReadSector( head, disk, readSector )
+                        doRead = false 
+                        busy = false
+                    end
+                    
+                    
+                    --DD.diskspeed = 0                
+                end
+            else
+                busy = true
+                DiskLoaded = false
+                DD.diskspeed = 0
+                if math.abs( wire.ports.Lock:getAngleVelocity()[3] ) < 50 then
+                    spinner["Disable"] = 1    
+                end
+                
+            end 
+            
+            async.yield()
+        end     
+        
+        
+    end):run() 
+    
+    
+    
+    hook.add("writecell","writecell",function(address, data)
+        if busy == false then
+            if address == 0 then --WRITE
+                busy = true
+                doWrite = true
+                writeSector = data
+            end
+            
+            if address == 1 then --READ
+                busy = true
+                doRead = true
+                readSector = data 
+            end
+        end
+        
+        if address >= 512 and address <= 1024 then
+            buffer[address-512]=data
+            
+        end
+        
+    end)
+    
+    hook.add("readcell","readcell",function(address)
+    
+        if address == 3 then --BUSY--
+            local b = 0
+            if busy == true then b = 1 else b = 0 end
+            return b
+        end
+        
+        if address == 4 then --Disk loaded
+            if DiskLoaded == true then return 1 else return 0 end
+        end
+        
+        if address == 5 and DiskLoaded == true then --sectors
+            return disk.DiskSectors
+        end
+    
+        if address >= 512 and address <= 1024 then
+            
+            --printTable(buffer)
+            return buffer[address-512]
+        end    
+    
+    end)
+    
+end
